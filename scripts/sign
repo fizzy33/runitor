@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Copyright 2020 - 2022, Berk D. Demir and the runitor contributors
+# SPDX-License-Identifier: OBSD
+set -euo pipefail
+
+SIGNATURE_NAMESPACE="bdd.fi/x/runitor release"
+
+##
+# /!\ THIS SCRIPT IS INTENDED FOR MAINTAINER USE ONLY /!\
+##
+if ! hash ssh-keygen ssh-add; then
+  echo "need ssh-keygen and ssh-add to sign." >&2
+  exit 69 # EX_UNAVAILABLE
+fi
+
+if (($# > 1)); then
+  echo "usage: $0 [releasedir]" >&2
+  exit 64 # EX_USAGE
+fi
+
+releasedir="${1-${PWD}}"
+
+# Maintainer is expected to prepare their ssh-agent with the right
+# signing key--and only that key--before running this script.
+ssh-keygen -Y sign \
+  -f <(ssh-add -L) \
+  -n "${SIGNATURE_NAMESPACE}" \
+  "${releasedir}/SHA256"

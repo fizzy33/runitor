@@ -1,22 +1,25 @@
+// Copyright 2020 - 2022, Berk D. Demir and the runitor contributors
+// SPDX-License-Identifier: OBSD
 package internal_test
 
 import (
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	. "bdd.fi/x/runitor/internal"
 )
 
-const TestUUID string = "test-uuid"
+const TestHandle string = "pingKey/testHandle"
 
 // Tests if APIClient makes requests with the expected method, content-type,
 // and user-agent.
 func TestPostRequest(t *testing.T) {
+	t.Parallel()
+
 	const (
 		expMethod = "POST"
 		expCT     = "text/plain"
@@ -46,7 +49,7 @@ func TestPostRequest(t *testing.T) {
 		UserAgent: expUA,
 	}
 
-	err := c.PingSuccess(TestUUID, nil)
+	_, err := c.PingSuccess(TestHandle, nil)
 	if err != nil {
 		t.Fatalf("expected successful Ping, got error: %+v", err)
 	}
@@ -54,54 +57,55 @@ func TestPostRequest(t *testing.T) {
 
 // Tests if request timeout errors and HTTP 5XX responses get retried.
 func TestPostRetries(t *testing.T) {
+	t.Parallel()
+
 	const SleepToCauseTimeout = 0
 
 	if testing.Short() {
 		t.Skip("skipping retry tests with backoff in short mode.")
 	}
 
-	backoff := 5 * time.Millisecond
-	clientTimeout := backoff
+	backoff := 1 * time.Millisecond
+	// clientTimeout needs to give enough time for a slow test runner to complete a TLS handshake.
+	// May 2022: less than 25ms might not be enough for some GitHub Actions runs.
+	clientTimeout := 200 * time.Millisecond
+	sleepTime := clientTimeout
 
-	retryTests := []int{
-		SleepToCauseTimeout,
-		http.StatusRequestTimeout,
-		500,
-		599,
-		SleepToCauseTimeout,
-		200, // must end with 200
-	}
+	retryTests := []int{SleepToCauseTimeout}                   // sleep
+	retryTests = append(retryTests, RetriableResponseCodes...) // all retriable response codes
+	retryTests = append(retryTests, http.StatusOK)             // MUST end with OK
 
-	expectedTries := len(retryTests)
+	expectedTries := uint32(len(retryTests))
+	var tries uint32
 
-	tries := 0
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if tries++; tries <= expectedTries {
-			status := retryTests[tries-1]
+		try := atomic.AddUint32(&tries, 1)
+		if try <= expectedTries {
+			status := retryTests[try-1]
 			if status == SleepToCauseTimeout {
-				time.Sleep(2 * clientTimeout)
+				time.Sleep(sleepTime)
 				return
 			}
 
 			w.WriteHeader(status)
 		} else {
-			t.Fatalf("expected client to try %d times, received %d tries", expectedTries, tries-1)
+			t.Fatalf("expected client to try %d times, received %d tries", expectedTries, try)
 		}
 	}))
 
 	defer ts.Close()
 
 	client := ts.Client()
-	client.Timeout = backoff
+	client.Timeout = clientTimeout
 
 	c := &APIClient{
 		BaseURL: ts.URL,
 		Client:  client,
-		Retries: expectedTries - 1,
+		Retries: uint(expectedTries - 1),
 		Backoff: backoff,
 	}
 
-	err := c.PingSuccess(TestUUID, nil)
+	_, err := c.PingSuccess(TestHandle, nil)
 	if err != nil {
 		t.Fatalf("expected successful Ping, got error: %+v", err)
 	}
@@ -113,6 +117,8 @@ func TestPostRetries(t *testing.T) {
 
 // Tests if APIClient fails right after receiving a nonretriable error.
 func TestPostNonRetriable(t *testing.T) {
+	t.Parallel()
+
 	status := http.StatusBadRequest
 	tries := 0
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -129,38 +135,43 @@ func TestPostNonRetriable(t *testing.T) {
 		Client:  ts.Client(),
 	}
 
-	err := c.PingSuccess(TestUUID, nil)
+	_, err := c.PingSuccess(TestHandle, nil)
 	if err == nil {
 		t.Errorf("expected PingSuccess to return non-nil error after non-retriable API response")
 	}
 }
 
-// Tests if Ping{Start,Success,Failure} functions hit the correct URI paths.
+// Tests if Ping{Start,Log,Status} functions hit the correct URI paths.
 func TestPostURIs(t *testing.T) {
-	type ping func(string, io.Reader) error
+	t.Parallel()
+
+	type ping func() (*InstanceConfig, error)
 
 	c := &APIClient{}
 
-	// uriPath -> pingFunction
 	testCases := map[string]ping{
-		fmt.Sprintf("/%s/%s", TestUUID, "start"): c.PingStart,
-		fmt.Sprintf("/%s", TestUUID):             c.PingSuccess,
-		fmt.Sprintf("/%s/%s", TestUUID, "fail"):  c.PingFailure,
+		"/start": func() (*InstanceConfig, error) { return c.PingStart(TestHandle) },
+		"":       func() (*InstanceConfig, error) { return c.PingSuccess(TestHandle, nil) },
+		"/fail":  func() (*InstanceConfig, error) { return c.PingFail(TestHandle, nil) },
+		"/log":   func() (*InstanceConfig, error) { return c.PingLog(TestHandle, nil) },
+		"/42":    func() (*InstanceConfig, error) { return c.PingExitCode(TestHandle, 42, nil) },
 	}
 
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		r.Body.Close()
-
-		uriPath := r.URL.Path
-		_, ok := testCases[uriPath]
+		tail := strings.TrimPrefix(r.URL.Path, "/"+TestHandle)
+		_, ok := testCases[tail]
 		if !ok {
-			t.Fatalf("Unknown URI path '%v' received", uriPath)
+			t.Fatalf("Unexpected request to URL path '%v'", r.URL.Path)
 		}
 
-		if string(body) != uriPath {
-			t.Errorf("Got a request for '%s' to path '%s'", body, uriPath)
-		}
+		// TODO(bdd): Find an equivalent replacement for this.
+		//            Do we really need it though?
+		//
+		// body, _ := io.ReadAll(r.Body)
+		// r.Body.Close()
+		// if string(body) != uriPath {
+		// 	t.Errorf("Got a request for '%s' to path '%s'", body, uriPath)
+		// }
 	}))
 
 	defer ts.Close()
@@ -168,16 +179,53 @@ func TestPostURIs(t *testing.T) {
 	c.BaseURL = ts.URL
 	c.Client = ts.Client()
 
-	for path, fn := range testCases {
-		if err := fn(TestUUID, strings.NewReader(path)); err != nil {
+	for _, fn := range testCases {
+		if _, err := fn(); err != nil {
 			t.Errorf("Ping failed: %+v", err)
 		}
+	}
+}
+
+// Tests additional request headers are sent.
+func TestPostReqHeaders(t *testing.T) {
+	t.Parallel()
+
+	expReqHeaders := map[string]string{
+		"foo-header": "foo-val",
+		"bar-header": "bar-val",
+		"baz-header": "baz-val",
+	}
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for expHeader, expVal := range expReqHeaders {
+			val := r.Header.Get(expHeader)
+			if len(val) == 0 {
+				t.Errorf("expected header %s to be set, but wasn't.", expHeader)
+			} else if val != expReqHeaders[expHeader] {
+				t.Errorf("expected header %s to be set to %s, but got %s.", expHeader, expVal, val)
+			}
+		}
+	}))
+
+	defer ts.Close()
+
+	c := &APIClient{
+		BaseURL:    ts.URL,
+		Client:     ts.Client(),
+		ReqHeaders: expReqHeaders,
+	}
+
+	_, err := c.PingSuccess(TestHandle, nil)
+	if err != nil {
+		t.Fatalf("expected successful Ping, got error: %+v", err)
 	}
 }
 
 // Tests if http.DefaultTransport can be type asserted to *http.Transport
 // and a TLSClientConfig is set.
 func TestNewDefaultTransportWithResumption(t *testing.T) {
+	t.Parallel()
+
 	defer func() {
 		if r := recover(); r != nil {
 			t.Errorf("panicked")

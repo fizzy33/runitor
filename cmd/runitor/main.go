@@ -1,3 +1,5 @@
+// Copyright 2020 - 2022, Berk D. Demir and the runitor contributors
+// SPDX-License-Identifier: OBSD
 package main // import "bdd.fi/x/runitor/cmd/runitor"
 
 import (
@@ -7,24 +9,30 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
-	"bdd.fi/x/runitor/internal"
+	. "bdd.fi/x/runitor/internal" //lint:ignore ST1001 internal
 )
 
 // RunConfig sets the behavior of a run.
 type RunConfig struct {
-	Quiet          bool // No cmd stdout
-	Silent         bool // No cmd stdout or stderr
-	NoStartPing    bool // Don't send Start ping
-	NoOutputInPing bool // Don't send command std{out, err} with Success and Failure pings
-	PingBodyLimit  uint // Truncate ping body to last N bytes
+	Quiet                   bool     // No cmd stdout
+	Silent                  bool     // No cmd stdout or stderr
+	NoStartPing             bool     // Don't send Start ping
+	NoOutputInPing          bool     // Don't send command std{out, err} with Success and Failure pings
+	PingBodyLimitIsExplicit bool     // Explicit limit via flags
+	PingBodyLimit           uint     // Truncate ping body to last N bytes
+	OnSuccess               PingType // Ping type to send when command exits successfully
+	OnNonzeroExit           PingType // Ping type to send when command exits with a nonzero code
+	OnExecFail              PingType // Ping type to send when runitor cannot execute the command
 }
 
 // Globals used for building help and identification strings.
@@ -35,41 +43,116 @@ const Name string = "runitor"
 // Homepage is the URL to the canonical website describing this command.
 const Homepage string = "https://bdd.fi/x/runitor"
 
-// Version is the version string that gets overridden at link time for releases.
-var Version string = "HEAD"
+// Version is the version string that gets overridden at link time by the
+// release build scripts.
+//
+// If the binary was build with `go install`, main module's version will be set
+// as the value of this variable.
+var Version string = ""
+
+func releaseVersion() string {
+	if len(Version) == 0 {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			Version = bi.Main.Version
+		}
+	}
+
+	return Version
+}
+
+type handleParams struct {
+	uuid, slug, pingKey string
+}
+
+// Handle composes the final check handle string to be used in the API URL
+// based on precedence or returns an error if a coexisting parameter isn't
+// passed.
+func (c *handleParams) Handle() (handle string, err error) {
+	gotUUID, gotSlug, gotPingKey := len(c.uuid) > 0, len(c.slug) > 0, len(c.pingKey) > 0
+
+	switch {
+	case gotUUID:
+		handle = c.uuid
+	case gotSlug && gotPingKey:
+		handle = c.pingKey + "/" + c.slug
+	case gotSlug:
+		err = errors.New("must also pass ping key either with '-ping-key PK' or HC_PING_KEY environment variable")
+	case gotPingKey:
+		err = errors.New("must also pass check slug with '-slug SL' or CHECK_SLUG environment variable")
+	default:
+		err = errors.New("must pass either a check UUID or check slug along with project ping key")
+	}
+
+	return
+}
+
+// FromFlagOrEnv is a helper to return flg if it isn't an empty string or look
+// up the environment variable env and return its value if it's set.
+// If neither are set returned value is an empty string.
+func FromFlagOrEnv(flg, env string) string {
+	if len(flg) == 0 {
+		v, ok := os.LookupEnv(env)
+		if ok && len(v) > 0 {
+			return v
+		}
+	}
+
+	return flg
+}
 
 func main() {
-	var (
-		apiURL         = flag.String("api-url", internal.DefaultBaseURL, "API URL. Takes precedence over HC_API_URL environment variable")
-		apiRetries     = flag.Int("api-retries", internal.DefaultRetries, "Number of times an API request will be retried if it fails with a transient error")
-		_apiTries      = flag.Int("api-tries", 0, "DEPRECATED (pending removal in v1.0.0): Use -api-retries")
-		apiTimeout     = flag.Duration("api-timeout", internal.DefaultTimeout, "Client timeout per request")
-		uuid           = flag.String("uuid", "", "UUID of check. Takes precedence over CHECK_UUID environment variable")
-		every          = flag.Duration("every", 0, "If non-zero, periodically run command at specified interval")
-		quiet          = flag.Bool("quiet", false, "Don't capture command's stdout")
-		silent         = flag.Bool("silent", false, "Don't capture command's stdout or stderr")
-		noStartPing    = flag.Bool("no-start-ping", false, "Don't send start ping")
-		noOutputInPing = flag.Bool("no-output-in-ping", false, "Don't send command's output in pings")
-		pingBodyLimit  = flag.Uint("ping-body-limit", 10000, "If non-zero, truncate the ping body to its last N bytes, including a truncation notice.")
-		version        = flag.Bool("version", false, "Show version")
-	)
+	apiURL := flag.String("api-url", DefaultBaseURL, "API URL. Takes precedence over HC_API_URL environment variable")
+	apiRetries := flag.Uint("api-retries", DefaultRetries, "Number of times an API request will be retried if it fails with a transient error")
+	apiTimeout := flag.Duration("api-timeout", DefaultTimeout, "Client timeout per request")
+	pingKey := flag.String("ping-key", "", "Ping Key. Takes precedence over HC_PING_KEY environment variable")
+	slug := flag.String("slug", "", "Slug of check. Requires a ping key. Takes precedence over CHECK_SLUG environment variable")
+	uuid := flag.String("uuid", "", "UUID of check. Takes precedence over CHECK_UUID environment variable")
+	every := flag.Duration("every", 0, "If non-zero, periodically run command at specified interval")
+	quiet := flag.Bool("quiet", false, "Don't capture command's stdout")
+	silent := flag.Bool("silent", false, "Don't capture command's stdout or stderr")
+	onSuccess := pingTypeFlag("on-success", PingTypeSuccess, "Ping type to send when command exits successfully")
+	onNonzeroExit := pingTypeFlag("on-nonzero-exit", PingTypeExitCode, "Ping type to send when command exits with a nonzero code")
+	onExecFail := pingTypeFlag("on-exec-fail", PingTypeFail, "Ping type to send when runitor cannot execute the command")
+	noStartPing := flag.Bool("no-start-ping", false, "Don't send start ping")
+	noOutputInPing := flag.Bool("no-output-in-ping", false, "Don't send command's output in pings")
+	pingBodyLimit := flag.Uint("ping-body-limit", 10_000, "If non-zero, truncate the ping body to its last N bytes, including a truncation notice.")
+	version := flag.Bool("version", false, "Show version")
+
+	reqHeaders := make(map[string]string)
+	flag.Func("req-header", "Additional request header as \"key: value\" string", func(s string) error {
+		kv := strings.SplitN(s, ":", 2)
+		if len(kv) != 2 {
+			return errors.New("header not in 'key: value' format")
+		}
+
+		reqHeaders[kv[0]] = kv[1]
+
+		return nil
+	})
 
 	flag.Parse()
 
 	if *version {
-		fmt.Println(Name, Version)
+		fmt.Println(Name, releaseVersion())
 		os.Exit(0)
 	}
 
-	if len(*uuid) == 0 {
-		v, ok := os.LookupEnv("CHECK_UUID")
-		if !ok || len(v) == 0 {
-			log.Fatal("Must pass check UUID either with '-uuid UUID' param or CHECK_UUID environment variable")
-		}
-
-		uuid = &v
+	ch := &handleParams{
+		uuid:    FromFlagOrEnv(*uuid, "CHECK_UUID"),
+		slug:    FromFlagOrEnv(*slug, "CHECK_SLUG"),
+		pingKey: FromFlagOrEnv(*pingKey, "HC_PING_KEY"),
+	}
+	handle, err := ch.Handle()
+	if err != nil {
+		log.Fatal(err)
 	}
 
+	// api-url flag vs HC_API_URL env var vs default value.
+	//
+	// The reason we cannot use FromFlagOrEnv() here is because we set a
+	// non-empty string default value for -api-url flag. We need to figure
+	// out if we're explicitly passed a flag or not to decide if we should
+	// read the alternate HC_API_URL environment variable.
 	urlFromArgs := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "api-url" {
@@ -83,40 +166,46 @@ func main() {
 		}
 	}
 
+	pingBodyLimitFromArgs := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "ping-body-limit" {
+			pingBodyLimitFromArgs = true
+		}
+	})
+
 	if flag.NArg() < 1 {
 		log.Fatal("missing command")
 	}
 
-	retries := int(math.Max(0, float64(*apiRetries))) // has to be >= 0
-
-	if *_apiTries > 0 {
-		retries = *_apiTries - 1
-
-		log.Print("The '-api-tries' flag is deprecated and will be removed in v1.0.0. Switch to '-api-retries' flag.")
-	}
+	retries := Max(0, *apiRetries) // has to be >= 0
 
 	cmd := flag.Args()
-	client := &internal.APIClient{
+	client := &APIClient{
 		BaseURL: *apiURL,
 		Retries: retries,
 		Client: &http.Client{
-			Transport: internal.NewDefaultTransportWithResumption(),
+			Transport: NewDefaultTransportWithResumption(),
 			Timeout:   *apiTimeout,
 		},
-		UserAgent: fmt.Sprintf("%s/%s (+%s)", Name, Version, Homepage),
+		UserAgent:  fmt.Sprintf("%s/%s (+%s)", Name, releaseVersion(), Homepage),
+		ReqHeaders: reqHeaders,
 	}
 
 	cfg := RunConfig{
-		Quiet:          *quiet || *silent,
-		Silent:         *silent,
-		NoStartPing:    *noStartPing,
-		NoOutputInPing: *noOutputInPing,
-		PingBodyLimit:  *pingBodyLimit,
+		Quiet:                   *quiet || *silent,
+		Silent:                  *silent,
+		NoStartPing:             *noStartPing,
+		NoOutputInPing:          *noOutputInPing,
+		PingBodyLimitIsExplicit: pingBodyLimitFromArgs,
+		PingBodyLimit:           *pingBodyLimit,
+		OnSuccess:               *onSuccess,
+		OnNonzeroExit:           *onNonzeroExit,
+		OnExecFail:              *onExecFail,
 	}
 
 	// Save this invocation so we don't repeat ourselves.
 	task := func() int {
-		return Do(cmd, cfg, *uuid, client)
+		return Do(cmd, cfg, handle, client)
 	}
 
 	exitCode := task()
@@ -143,32 +232,51 @@ func main() {
 	}
 }
 
-// Do function runs the cmd line, tees its output to terminal & ping body as configured in cfg
-// and pings the monitoring API to signal start, and then success or failure of execution.
-func Do(cmd []string, cfg RunConfig, uuid string, p internal.Pinger) (exitCode int) {
+// Do function runs the cmd line, tees its output to terminal & ping body as
+// configured in cfg and pings the monitoring API to signal start, and then
+// success or failure of execution. Returns the exit code from the ran command
+// unless execution has failed, in such case 1 is returned.
+func Do(cmd []string, cfg RunConfig, handle string, p Pinger) int {
 	if !cfg.NoStartPing {
-		if err := p.PingStart(uuid, nil); err != nil {
-			log.Print("PingStart: ", err)
+		icfg, err := p.PingStart(handle)
+		if err != nil {
+			log.Print("Ping(start): ", err)
+		} else if instanceLimit, ok := icfg.PingBodyLimit.Get(); ok {
+			if cfg.PingBodyLimitIsExplicit {
+				// Command line flag `-ping-body-limit` was used and
+				// the service instance returned a `Ping-Body-Limit` header.
+				// Pick the smaller value.
+				cfg.PingBodyLimit = Min(cfg.PingBodyLimit, instanceLimit)
+			} else {
+				// Let the instance override the runitor default up to 10MB.
+				//
+				// TODO(bdd):
+				// We impose this limit for now because current
+				// ring buffer implementation tries to eagerly
+				// allocate a zero filled array at this
+				// capacity.
+				cfg.PingBodyLimit = Min(instanceLimit, 10_000_000)
+			}
 		}
 	}
 
 	var (
-		pbr *internal.RingBuffer
-		pb  io.ReadWriter
+		ringbuf  *RingBuffer
+		pingbody io.ReadWriter
 	)
 
 	if cfg.PingBodyLimit > 0 {
-		pbr = internal.NewRingBuffer(int(cfg.PingBodyLimit))
-		pb = io.ReadWriter(pbr)
+		ringbuf = NewRingBuffer(int(cfg.PingBodyLimit))
+		pingbody = io.ReadWriter(ringbuf)
 	} else {
-		pb = new(bytes.Buffer)
+		pingbody = new(bytes.Buffer)
 	}
 
 	var mw io.Writer
 	if cfg.NoOutputInPing {
 		mw = io.MultiWriter(os.Stdout)
 	} else {
-		mw = io.MultiWriter(os.Stdout, pb)
+		mw = io.MultiWriter(os.Stdout, pingbody)
 	}
 
 	// WARNING:
@@ -184,31 +292,46 @@ func Do(cmd []string, cfg RunConfig, uuid string, p internal.Pinger) (exitCode i
 	}
 
 	exitCode, err := Run(cmd, cmdStdout, cmdStderr)
-	if err != nil {
-		fmt.Fprintf(io.MultiWriter(os.Stderr, pb),
-			"Command execution failed: %v\n", err)
-		// Use POSIX EXIT_FAILURE (1) for cases where the specified
-		// command fails to execute.  Execution will continue and a
-		// failure ping will be sent due to non-zero exit code.
+	var ping PingType
+	switch {
+	case exitCode == 0 && err == nil:
+		ping = cfg.OnSuccess
+
+	case exitCode > 0 && err != nil:
+		// Successfully executed the command.
+		// Command exited with nonzero code.
+		fmt.Fprintf(pingbody, "\n[%s] %v", Name, err)
+		ping = cfg.OnNonzeroExit
+
+	case exitCode == -1 && err != nil:
+		// Could not execute the command.
+		// Write to host stderr and the ping body.
+		w := io.MultiWriter(os.Stderr, pingbody)
+		fmt.Fprintf(w, "[%s] %v\n", Name, err)
+		ping = cfg.OnExecFail
 		exitCode = 1
 	}
 
-	if pbr != nil && pbr.Wrapped() {
-		fmt.Fprintf(pb, "\n[%s] Output truncated to last %d bytes.", Name, cfg.PingBodyLimit)
+	if ringbuf != nil && ringbuf.Wrapped() {
+		fmt.Fprintf(pingbody, "\n[%s] Output truncated to last %d bytes.", Name, ringbuf.Cap())
 	}
 
-	if exitCode != 0 {
-		fmt.Fprintf(pb, "\n[%s] Command exited with code %d.", Name, exitCode)
-
-		if err := p.PingFailure(uuid, pb); err != nil {
-			log.Print("PingFailure: ", err)
-		}
-
-		return exitCode
+	switch ping {
+	case PingTypeSuccess:
+		_, err = p.PingSuccess(handle, pingbody)
+	case PingTypeFail:
+		_, err = p.PingFail(handle, pingbody)
+	case PingTypeLog:
+		_, err = p.PingLog(handle, pingbody)
+	default:
+		// A safe default: PingExitCode
+		// It's too late error out here.
+		// Command got executed. We need to deliver a ping.
+		_, err = p.PingExitCode(handle, exitCode, pingbody)
 	}
 
-	if err := p.PingSuccess(uuid, pb); err != nil {
-		log.Print("PingSuccess: ", err)
+	if err != nil {
+		log.Printf("Ping(%s): %v\n", ping.String(), err)
 	}
 
 	return exitCode
@@ -221,20 +344,24 @@ func Run(cmd []string, stdout, stderr io.Writer) (exitCode int, err error) {
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, stdout, stderr
 
 	err = c.Run()
+	exitCode = c.ProcessState.ExitCode()
+
 	if err != nil {
-		// Convert *exec.ExitError to just exit code and no error.
-		// From our point of view, it's not really an error but a value.
 		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ProcessState.ExitCode(), nil
+		if errors.As(err, &ee) && exitCode == -1 {
+			// Killed with a signal.
+			exitCode = 1
+			err = fmt.Errorf("%w", ee)
+			return
 		}
 	}
 
-	// Here we either have:
-	// a) we couldn't execute the command and we have a real error in our hands.
-	//    exitCode's zero value is '0' but it doesn't matter as we'll return non-nil err.
-	// b) the command ran successfully and exit with code 0.
-	//    exitCode hasn't been mutated, so its zero value of '0' is what we would like to return
-	//    anyway.
+	// On Windows applications can use any 32-bit integer as the exit code.
+	// Healthchecks.io API only allows [0-255].
+	// So we clamp it.
+	if runtime.GOOS == "windows" && exitCode > 255 {
+		exitCode = 1 // ¯\_(ツ)_/¯
+	}
+
 	return
 }

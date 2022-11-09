@@ -1,3 +1,6 @@
+// Copyright 2020 - 2022, Berk D. Demir and the runitor contributors
+// SPDX-License-Identifier: OBSD
+//
 // Package internal contains healthchecks.io HTTP API client implementation for
 // cmd/runitor's use.
 //
@@ -11,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	urlpkg "net/url"
+	"strconv"
 	"time"
 )
 
@@ -21,11 +25,22 @@ const (
 	DefaultTimeout = 5 * time.Second
 	// Default number of retries.
 	DefaultRetries = 2
+	// Header to relay instance's ping body limit.
+	PingBodyLimitHeader = "Ping-Body-Limit"
 )
 
 var (
 	ErrNonRetriable = errors.New("nonretriable error response")
 	ErrMaxTries     = errors.New("max tries reached")
+	// HTTP response codes eligible for retries.
+	RetriableResponseCodes = []int{
+		http.StatusRequestTimeout,      // 408
+		http.StatusTooManyRequests,     // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout,      // 504
+	}
 )
 
 // NewDefaultTransportWithResumption returns an http.Transport based on
@@ -44,12 +59,24 @@ func NewDefaultTransportWithResumption() *http.Transport {
 	return t
 }
 
+func retriableResponse(code int) bool {
+	for _, i := range RetriableResponseCodes {
+		if code == i {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Pinger is the interface to Healthchecks.io pinging API
 // https://healthchecks.io/docs/http_api/
 type Pinger interface {
-	PingStart(uuid string, body io.Reader) error
-	PingSuccess(uuid string, body io.Reader) error
-	PingFailure(uuid string, body io.Reader) error
+	PingStart(handle string) (*InstanceConfig, error)
+	PingLog(handle string, body io.Reader) (*InstanceConfig, error)
+	PingSuccess(handle string, body io.Reader) (*InstanceConfig, error)
+	PingFail(handle string, body io.Reader) (*InstanceConfig, error)
+	PingExitCode(handle string, exitCode int, body io.Reader) (*InstanceConfig, error)
 }
 
 // APIClient holds API endpoint URL, client behavior configuration, and embeds http.Client.
@@ -59,8 +86,8 @@ type APIClient struct {
 
 	// Retries is the number of times the pinger will retry an API request
 	// if it fails with a timeout or temporary kind of error, or an HTTP
-	// status of 408 or 5XX.
-	Retries int
+	// status of 408, 429, 500, ... (see RetriableResponseCodes)
+	Retries uint
 
 	// UserAgent, when non-empty, is the value of 'User-Agent' HTTP header
 	// for outgoing requests.
@@ -69,8 +96,33 @@ type APIClient struct {
 	// Backoff is the duration used as the unit of linear backoff.
 	Backoff time.Duration
 
+	// ReqHeaders is a map of additional headers to be sent with every request.
+	ReqHeaders map[string]string
+
 	// Embed
 	*http.Client
+}
+
+// InstanceConfig holds the instance specific configuration parameters received
+// as HTTP headers to ping requests.
+type InstanceConfig struct {
+	PingBodyLimit Optional[uint]
+}
+
+// FromResponse populates InstanceConfig values from a ping response.
+func (c *InstanceConfig) FromResponse(resp *http.Response) {
+	strval := resp.Header.Get(PingBodyLimitHeader)
+	if len(strval) == 0 {
+		return
+	}
+
+	// uint32 should be enough for everyone(tm)
+	val, err := strconv.ParseUint(strval, 10, 32)
+	if err != nil {
+		return
+	}
+
+	c.PingBodyLimit = Some(uint(val))
 }
 
 // Post wraps embedded http.Client's Post to implement simple retry logic and
@@ -105,6 +157,15 @@ func (c *APIClient) Post(url, contentType string, body io.Reader) (resp *http.Re
 	// and no Transfer-Encoding.
 	if rb, ok := body.(*RingBuffer); ok {
 		req.ContentLength = int64(rb.Len())
+		if req.ContentLength == 0 {
+			req.Body = http.NoBody
+		}
+	}
+
+	if c.ReqHeaders != nil {
+		for k, v := range c.ReqHeaders {
+			req.Header.Set(k, v)
+		}
 	}
 
 	req.Header.Set("Content-Type", contentType)
@@ -118,7 +179,7 @@ func (c *APIClient) Post(url, contentType string, body io.Reader) (resp *http.Re
 		backoffStep = time.Second
 	}
 
-	tries := 0
+	var tries uint
 Try:
 	// Linear backoff at second granularity
 	time.Sleep(time.Duration(tries) * backoffStep)
@@ -143,7 +204,10 @@ Try:
 	switch {
 	case resp.StatusCode == http.StatusOK:
 		return
-	case resp.StatusCode == http.StatusRequestTimeout || (resp.StatusCode >= 500 && resp.StatusCode <= 599):
+	case retriableResponse(resp.StatusCode):
+		code := resp.StatusCode
+		text := http.StatusText(code)
+		err = fmt.Errorf("%d %s", code, text)
 		goto Try
 	default:
 		err = fmt.Errorf("%w: %s", ErrNonRetriable, resp.Status)
@@ -151,33 +215,50 @@ Try:
 	}
 }
 
-// PingStart sends a Start Ping for the check with passed uuid and attaches
-// body as the logged context.
-func (c *APIClient) PingStart(uuid string, body io.Reader) error {
-	return c.ping(uuid, body, "/start")
+// PingStart sends a start ping for the check handle.
+func (c *APIClient) PingStart(handle string) (*InstanceConfig, error) {
+	return c.ping(handle, "start", nil)
 }
 
-// PingSuccess sends a Success Ping for the check with passed uuid and attaches
-// body as the logged context.
-func (c *APIClient) PingSuccess(uuid string, body io.Reader) error {
-	return c.ping(uuid, body, "")
+// PingSuccess sends a success ping for the check handle and attaches body as
+// the logged context.
+func (c *APIClient) PingSuccess(handle string, body io.Reader) (*InstanceConfig, error) {
+	return c.ping(handle, "", body)
 }
 
-// PingFailure sends a Fail Ping for the check with passed uuid and attaches
-// body as the logged context.
-func (c *APIClient) PingFailure(uuid string, body io.Reader) error {
-	return c.ping(uuid, body, "/fail")
+// PingFail sends a failure ping for the check handle and attaches body as the
+// logged context.
+func (c *APIClient) PingFail(handle string, body io.Reader) (*InstanceConfig, error) {
+	return c.ping(handle, "fail", body)
 }
 
-func (c *APIClient) ping(uuid string, body io.Reader, typePath string) error {
-	u := fmt.Sprintf("%s/%s%s", c.BaseURL, uuid, typePath)
+// PingLog sends a logging only ping for the check handle and attaches body as
+// the logged context.
+func (c *APIClient) PingLog(handle string, body io.Reader) (*InstanceConfig, error) {
+	return c.ping(handle, "log", body)
+}
+
+// PingExitCode sends the exit code of the monitored command for the check handle
+// and attaches body as the logged context.
+func (c *APIClient) PingExitCode(handle string, exitCode int, body io.Reader) (*InstanceConfig, error) {
+	return c.ping(handle, fmt.Sprintf("%d", exitCode), body)
+}
+
+func (c *APIClient) ping(handle string, path string, body io.Reader) (*InstanceConfig, error) {
+	u := c.BaseURL + "/" + handle
+	if len(path) > 0 {
+		u += "/" + path
+	}
 
 	resp, err := c.Post(u, "text/plain", body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	resp.Body.Close()
+	defer resp.Body.Close()
 
-	return nil
+	icfg := &InstanceConfig{}
+	icfg.FromResponse(resp)
+
+	return icfg, nil
 }

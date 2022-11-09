@@ -1,3 +1,5 @@
+// Copyright 2020 - 2022, Berk D. Demir and the runitor contributors
+// SPDX-License-Identifier: OBSD
 package internal
 
 import (
@@ -57,7 +59,7 @@ func (r *RingBuffer) write(p []byte) (n int) {
 	}
 
 	// If source is larger than the capacity of the ring buffer, we'll
-	// need to overwrite unobserable data. Optimize this by only writing
+	// need to overwrite unobservable data. Optimize this by only writing
 	// last `r.Cap()` bytes from source.
 	if len(p) > r.Cap() {
 		// jump over what would be overwritten and count as written
