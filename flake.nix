@@ -15,7 +15,7 @@
           buildInputs = with pkgs; [
             # build
             go
-            self.packages.${system}.enumer
+            # self.packages.${system}.enumer
 
             # release
             gh  # make a release an github and upload artifacts
@@ -52,22 +52,22 @@
           };
         };
 
-        enumer = buildGoModule rec {
-          pname = "enumer";
-          version = "1.5.7";
-          src = fetchFromGitHub {
-            owner = "dmarkham";
-            repo = "enumer";
-            rev = "v${version}";
-            sha256 = "2fVWrrWOiCtg7I3Lul2PgQ2u/qDEDioPSB61Tp0rfEo=";
-          };
-          vendorSha256 = "BmFv0ytRnjaB7z7Gb+38Fw2ObagnaFMnMhlejhaGxsk=";
-          meta = with lib; {
-            description = "A Go tool to auto generate methods for your enums";
-            license =  licenses.bsd2;
-            maintainers = with maintainers; [ bdd ];
-          };
-        };
+        # enumer = buildGoModule rec {
+        #   pname = "enumer";
+        #   version = "1.5.7";
+        #   src = fetchFromGitHub {
+        #     owner = "dmarkham";
+        #     repo = "enumer";
+        #     rev = "v${version}";
+        #     sha256 = "2fVWrrWOiCtg7I3Lul2PgQ2u/qDEDioPSB61Tp0rfEo=";
+        #   };
+        #   vendorSha256 = "BmFv0ytRnjaB7z7Gb+38Fw2ObagnaFMnMhlejhaGxsk=";
+        #   meta = with lib; {
+        #     description = "A Go tool to auto generate methods for your enums";
+        #     license =  licenses.bsd2;
+        #     maintainers = with maintainers; [ bdd ];
+        #   };
+        # };
 
       };
     }
