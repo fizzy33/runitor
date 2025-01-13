@@ -32,7 +32,7 @@
           pname = "runitor";
           revDate = builtins.substring 0 8 (self.lastModifiedDate or "19700101");
           version = "${revDate}-${self.shortRev or "dirty"}";
-          vendorSha256 = null;
+          # vendorSha256 = null;
           src = ./.;
           ldflags = [ "-s" "-w" "-X main.Version=v${version}" ];
           meta = with lib; {
